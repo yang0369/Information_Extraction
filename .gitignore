@@ -1,0 +1,6 @@
+dataset/
+*.log
+*.pt
+/SER_HuggingFace/model
+/SER_HuggingFace/out
+/unilm

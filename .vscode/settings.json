@@ -1,0 +1,15 @@
+{
+    "python.testing.pytestArgs": ["{workspace}/RE_2"],  // set pytest root dir
+    "python.terminal.activateEnvironment": true,
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestEnabled": true,
+
+    // linting
+    "python.linting.flake8Enabled": true,
+    "python.linting.enabled": true,
+    "python.linting.flake8Args": ["--select", "E20,E21,E22,E23,E24,E3,F401,F8", "--ignore=E226", "--verbose"],
+
+    // pylance
+    "python.analysis.extraPaths": [""],  // set pylance paths, default import paths
+    "python.autoComplete.extraPaths": [""],
+}

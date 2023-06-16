@@ -1,0 +1,40 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Current File",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "stopOnEntry": true,
+            "justMyCode": false,
+        },
+        {
+            "name": "Python: run RE_HuggingFace",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/RE_HuggingFace/main.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                // "CUDA_LAUNCH_BLOCKING": "1",
+                "PYTHONPATH": "${workspaceFolder}" // set multiple paths to sys.path, windows by semicolon while linux by colon
+            }
+        },
+        {
+            "name": "Python: run SER_HuggingFace",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/SER_HuggingFace/main.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        }
+    ]
+}
