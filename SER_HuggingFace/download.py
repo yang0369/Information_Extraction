@@ -2,13 +2,17 @@
 import json
 import logging
 import os
+from pathlib import Path
 
 import datasets
 
 from PIL import Image
 import numpy as np
 
+ROOT = Path(__file__).parents[1]
+
 from transformers import AutoTokenizer
+
 
 def load_image(image_path, size=None):
     image = Image.open(image_path).convert("RGB")
@@ -45,29 +49,26 @@ def merge_bbox(bbox_list):
     return [min(x0), min(y0), max(x1), max(y1)]
 
 
-LAN = "en"
 logger = logging.getLogger(__name__)
 
 
 class XFUNConfig(datasets.BuilderConfig):
     """BuilderConfig for XFUN."""
 
-    def __init__(self, lang, **kwargs):
+    def __init__(self, **kwargs):
         """
         Args:
             lang: string, language for the input text
             **kwargs: keyword arguments forwarded to super.
         """
         super(XFUNConfig, self).__init__(**kwargs)
-        self.lang = lang
 
 
 class XFUN(datasets.GeneratorBasedBuilder):
     """XFUN dataset."""
 
-    BUILDER_CONFIGS = [XFUNConfig(name="sample", lang=LAN)]
+    BUILDER_CONFIGS = [XFUNConfig(name="en")]
 
-    # tokenizer = AutoTokenizer.from_pretrained("xlm-roberta-base")
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 
     def _info(self):
@@ -108,11 +109,11 @@ class XFUN(datasets.GeneratorBasedBuilder):
         """Returns SplitGenerators."""
         return [
             datasets.SplitGenerator(
-                name=datasets.Split.TRAIN, gen_kwargs={"filepath": [f"/home/kewen_yang/RE_2/dataset/{LAN}_sample/{LAN}.train.json",
-                                                                    f"/home/kewen_yang/RE_2/dataset/{LAN}_sample/"]}),
+                name=datasets.Split.TRAIN, gen_kwargs={"filepath": [ROOT / "dataset/en_sample/en.train.json",
+                                                                    ROOT / "dataset/en_sample/"]}),
             datasets.SplitGenerator(
-                name=datasets.Split.VALIDATION, gen_kwargs={"filepath": [f"/home/kewen_yang/RE_2/dataset/{LAN}_sample/{LAN}.val.json",
-                                                                         f"/home/kewen_yang/RE_2/dataset/{LAN}_sample/"]}),
+                name=datasets.Split.VALIDATION, gen_kwargs={"filepath": [ROOT / "dataset/en_sample/en.val.json",
+                                                                         ROOT / "dataset/en_sample/"]}),
 
             # datasets.SplitGenerator(name=datasets.Split.TEST, gen_kwargs={"filepaths": test_files_for_many_langs}),
         ]
@@ -122,15 +123,11 @@ class XFUN(datasets.GeneratorBasedBuilder):
         with open(filepath[0], "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        # loop each doc in documents
         for doc in data["documents"]:
             print(f'processing {doc["img"]["fname"]}')
-
-            # get image info
             doc["img"]["fpath"] = os.path.join(filepath[1], doc["img"]["fname"])
             image, size = load_image(doc["img"]["fpath"], size=224)
             original_image, _ = load_image(doc["img"]["fpath"])
-
             document = doc["document"]
             tokenized_doc = {"input_ids": [], "bbox": [], "labels": []}
             entities = []
@@ -138,7 +135,6 @@ class XFUN(datasets.GeneratorBasedBuilder):
             id2label = {}
             entity_id_to_index_map = {}
             empty_entity = set()
-
             for line in document:
                 if len(line["text"]) == 0:
                     empty_entity.add(line["id"])
@@ -270,3 +266,22 @@ class XFUN(datasets.GeneratorBasedBuilder):
                     }
                 )
                 yield f"{doc['id']}_{chunk_id}", item
+
+
+"""
+Input Schema:
+
+{
+    "id": image name, e.g. "en_train_0_0"
+    "input_ids": List[token_ids], all_texts = "".join([tokenizer.decode(i) for i in dataset["train"][0]["input_ids"]])
+    "bbox": tensors,
+    "labels": tensors,
+    "hd_image":
+    "entities":
+    "relations":
+    "attention_mask":
+    "image":
+}
+
+for English, tokens usually equals to words, but when word is out of vacab, it will be tokenized into multiple common tokens. e.g. "vashering" --> ['va', '##sher', '##ing']
+"""

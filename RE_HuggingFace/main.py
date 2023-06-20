@@ -1,3 +1,4 @@
+from collections import defaultdict
 import logging
 import sys
 from dataclasses import dataclass
@@ -9,7 +10,6 @@ import matplotlib.pyplot as plt
 from PIL import Image, JpegImagePlugin
 
 JpegImagePlugin._getmp = lambda: None
-import datasets
 import matplotlib
 import numpy as np
 import torch
@@ -17,7 +17,6 @@ import torch
 import tornado
 from datasets import load_dataset
 from pytz import timezone
-from torch.utils.data import DataLoader
 
 from transformers import (AutoModelForTokenClassification, AutoProcessor,
                           AutoTokenizer, LayoutLMForRelationExtraction,
@@ -200,23 +199,32 @@ val_dataset = dataset['validation']
 #################################### Inference Pipeline ####################################
 # test_image = train_dataset[48]['original_image']
 test_image = Image.open(ROOT / 'dataset/test/1.jpg')
-plt.imshow(test_image)
-plt.show()
+# plt.imshow(test_image)
+# plt.show()
 
 # load model + processor from the hub
 processor = AutoProcessor.from_pretrained(ROOT / "SER_HuggingFace" / "model")
 model = AutoModelForTokenClassification.from_pretrained(ROOT / "SER_HuggingFace" / "model")
 
-
 # prepare inputs for the model
 # we set `return_offsets_mapping=True` as we use the offsets to know which tokens are subwords and which aren't
 inputs = processor(test_image, return_offsets_mapping=True, padding="max_length", max_length=512, truncation=True, return_tensors="pt")
 
+original_text = processor.tokenizer.convert_tokens_to_string([processor.tokenizer.decode(i, skip_special_tokens=True) for i in inputs["input_ids"][0].tolist()])
+# all_token_text = [processor.tokenizer.decode(i, skip_special_tokens=True) for i in inputs["input_ids"][0].tolist()]
 
 inputs = inputs.to(DEVICE)
 model.to(DEVICE)
 
+# offset_mapping: indicates the start and end index of the actual subword w.r.t each token text, e.g. '##omi' with offset [2, 5] -> 'omi'
 offset_mapping = inputs.pop("offset_mapping")
+
+# word_ids: indicates if the subtokens belong to the same word.
+word_ids = inputs.encodings[0].word_ids
+
+token_ids = inputs.input_ids[0].tolist()
+
+if_special = inputs.encodings[0].special_tokens_mask
 
 # forward pass
 with torch.no_grad():
@@ -225,31 +233,48 @@ with torch.no_grad():
 # take argmax on last dimension to get predicted class ID per token
 predictions = outputs.logits.argmax(-1).squeeze().tolist()
 
-# we're only interested in tokens which aren't subwords
-# we'll use the offset mapping for that
-is_subword = np.array(offset_mapping.squeeze().tolist())[:, 0] != 0
+# # check if it's subwords
+# is_subword = np.array(offset_mapping.squeeze().tolist())[:, 0] != 0
 
-id2label = {"HEADER": 0, "QUESTION": 1, "ANSWER": 2}
+# merge subwords into word-level based on word_ids
+word_pred = defaultdict(lambda: -1)
+words = defaultdict(list)
+for idx, tp in enumerate(zip(if_special, token_ids, predictions, word_ids)):
+  if idx == 0 or bool(tp[0]):
+    continue
+
+  words[tp[-1]].append(idx)
+  if word_pred[tp[-1]] == -1:
+    word_pred[tp[-1]] = tp[2]
+
+id2label = {"QUESTION": 0, "ANSWER": 1}
 
 # finally, store recognized "question" and "answer" entities in a list
 entities = []
 current_entity = None
 start = None
 end = None
-for idx, (id, pred) in enumerate(zip(inputs.input_ids[0].tolist(), predictions)):
-  if not is_subword[idx]:
-    predicted_label = model.config.id2label[pred]
+for idx, (id, pred) in enumerate(zip(words.values(), word_pred.values())):
+  predicted_label = model.config.id2label[pred]
+
+  if predicted_label.startswith("B") and current_entity is None:
+    # means we're at the start of a new entity
+    current_entity = predicted_label.replace("B-", "")
+    start = min(id)
+    print(f"--------------New entity: at index {start}", current_entity)
+
+  if current_entity is not None and current_entity not in predicted_label:
+    # means we're at the end of a new entity
+    end = max(words[idx - 1])
+    print("---------------End of new entity")
+    entities.append((start, end, current_entity, id2label[current_entity]))
+    current_entity = None
+
     if predicted_label.startswith("B") and current_entity is None:
       # means we're at the start of a new entity
       current_entity = predicted_label.replace("B-", "")
-      print(f"--------------New entity: at index {idx}", current_entity)
-      start = idx
-    if current_entity is not None and current_entity not in predicted_label:
-      # means we're at the end of a new entity
-      end = idx
-      print("---------------End of new entity")
-      entities.append((start, end, current_entity, id2label[current_entity]))
-      current_entity = None
+      start = min(id)
+      print(f"--------------New entity: at index {start}", current_entity)
 
 
 # step 2: run LayoutLMv2ForRelationExtraction
