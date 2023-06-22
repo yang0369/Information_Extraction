@@ -211,113 +211,114 @@ model = AutoModelForTokenClassification.from_pretrained(ROOT / "SER_HuggingFace"
 # we set `return_offsets_mapping=True` as we use the offsets to know which tokens are subwords and which aren't
 inputs = processor(test_image, return_offsets_mapping=True, padding="max_length", max_length=512, truncation=True, return_tensors="pt")
 
-original_text = processor.tokenizer.convert_tokens_to_string([processor.tokenizer.decode(i, skip_special_tokens=True) for i in inputs["input_ids"][0].tolist()])
-# all_token_text = [processor.tokenizer.decode(i, skip_special_tokens=True) for i in inputs["input_ids"][0].tolist()]
+# original_text = processor.tokenizer.convert_tokens_to_string([processor.tokenizer.decode(i, skip_special_tokens=True) for i in inputs["input_ids"][0].tolist()])
+# # all_token_text = [processor.tokenizer.decode(i, skip_special_tokens=True) for i in inputs["input_ids"][0].tolist()]
 
-inputs = inputs.to(DEVICE)
-model.to(DEVICE)
+# inputs = inputs.to(DEVICE)
+# model.to(DEVICE)
 
-# offset_mapping: indicates the start and end index of the actual subword w.r.t each token text, e.g. '##omi' with offset [2, 5] -> 'omi'
-offset_mapping = inputs.pop("offset_mapping")
+# # offset_mapping: indicates the start and end index of the actual subword w.r.t each token text, e.g. '##omi' with offset [2, 5] -> 'omi'
+# offset_mapping = inputs.pop("offset_mapping")
 
-# word_ids: indicates if the subtokens belong to the same word.
-word_ids = inputs.encodings[0].word_ids
+# # word_ids: indicates if the subtokens belong to the same word.
+# word_ids = inputs.encodings[0].word_ids
 
-token_ids = inputs.input_ids[0].tolist()
+# token_ids = inputs.input_ids[0].tolist()
 
-if_special = inputs.encodings[0].special_tokens_mask
+# if_special = inputs.encodings[0].special_tokens_mask
 
-# forward pass
-with torch.no_grad():
-  outputs = model(**inputs)
+# # forward pass
+# with torch.no_grad():
+#   outputs = model(**inputs)
 
-# take argmax on last dimension to get predicted class ID per token
-predictions = outputs.logits.argmax(-1).squeeze().tolist()
+# # take argmax on last dimension to get predicted class ID per token
+# predictions = outputs.logits.argmax(-1).squeeze().tolist()
 
-# # check if it's subwords
-# is_subword = np.array(offset_mapping.squeeze().tolist())[:, 0] != 0
+# # # check if it's subwords
+# # is_subword = np.array(offset_mapping.squeeze().tolist())[:, 0] != 0
 
-# merge subwords into word-level based on word_ids
-word_pred = defaultdict(lambda: -1)
-words = defaultdict(list)
-for idx, tp in enumerate(zip(if_special, token_ids, predictions, word_ids)):
-  if idx == 0 or bool(tp[0]):
-    continue
+# # merge subwords into word-level based on word_ids
+# word_pred = defaultdict(lambda: -1)
+# words = defaultdict(list)
+# for idx, tp in enumerate(zip(if_special, token_ids, predictions, word_ids)):
+#   if idx == 0 or bool(tp[0]):
+#     continue
 
-  words[tp[-1]].append(idx)
-  if word_pred[tp[-1]] == -1:
-    word_pred[tp[-1]] = tp[2]
+#   words[tp[-1]].append(idx)
+#   if word_pred[tp[-1]] == -1:
+#     word_pred[tp[-1]] = tp[2]
 
-id2label = {"QUESTION": 0, "ANSWER": 1}
+# id2label = {"QUESTION": 0, "ANSWER": 1}
 
-# finally, store recognized "question" and "answer" entities in a list
-entities = []
-current_entity = None
-start = None
-end = None
-for idx, (id, pred) in enumerate(zip(words.values(), word_pred.values())):
-  predicted_label = model.config.id2label[pred]
+# # finally, store recognized "question" and "answer" entities in a list
+# entities = []
+# current_entity = None
+# start = None
+# end = None
+# for idx, (id, pred) in enumerate(zip(words.values(), word_pred.values())):
+#   predicted_label = model.config.id2label[pred]
 
-  if predicted_label.startswith("B") and current_entity is None:
-    # means we're at the start of a new entity
-    current_entity = predicted_label.replace("B-", "")
-    start = min(id)
-    print(f"--------------New entity: at index {start}", current_entity)
+#   if predicted_label.startswith("B") and current_entity is None:
+#     # means we're at the start of a new entity
+#     current_entity = predicted_label.replace("B-", "")
+#     start = min(id)
+#     print(f"--------------New entity: at index {start}", current_entity)
 
-  if current_entity is not None and current_entity not in predicted_label:
-    # means we're at the end of a new entity
-    end = max(words[idx - 1])
-    print("---------------End of new entity")
-    entities.append((start, end, current_entity, id2label[current_entity]))
-    current_entity = None
+#   if current_entity is not None and current_entity not in predicted_label:
+#     # means we're at the end of a new entity
+#     end = max(words[idx - 1])
+#     print("---------------End of new entity")
+#     entities.append((start, end, current_entity, id2label[current_entity]))
+#     current_entity = None
 
-    if predicted_label.startswith("B") and current_entity is None:
-      # means we're at the start of a new entity
-      current_entity = predicted_label.replace("B-", "")
-      start = min(id)
-      print(f"--------------New entity: at index {start}", current_entity)
+#     if predicted_label.startswith("B") and current_entity is None:
+#       # means we're at the start of a new entity
+#       current_entity = predicted_label.replace("B-", "")
+#       start = min(id)
+#       print(f"--------------New entity: at index {start}", current_entity)
 
 # #################################### Load our dataset ####################################
 # step 2: run LayoutLMv2ForRelationExtraction
 relation_extraction_model = LayoutLMv2ForRelationExtraction.from_pretrained(ROOT / "RE_HuggingFace/model/checkpoint_2023_06_22_11_48.pt/checkpoint-5000")
 relation_extraction_model.to(DEVICE)
 
-# with open(ROOT / "dataset" / "test.json", "rb") as f:
-#   file = json.load(f)
-# tokenizer = AutoTokenizer.from_pretrained("microsoft/layoutlm-base-uncased")
-# entity_dict = file["entity_dict"]
-# inputs_ = file["input"]
+with open(ROOT / "dataset" / "test.json", "rb") as f:
+  file = json.load(f)
+tokenizer = AutoTokenizer.from_pretrained("microsoft/layoutlm-base-uncased")
+entity_dict = file["entity_dict"]
+entity_dict["label"] = [i + 1 for i in entity_dict["label"]]
+inputs_ = file["input"]
 
-# for k, v in inputs_.items():
-#   inputs_[k] = torch.tensor(inputs_[k])
+for k, v in inputs_.items():
+  inputs_[k] = torch.tensor(inputs_[k])
 
-# # inputs_["image"] = inputs_["image"].permute(0, 3, 1, 2)
+# inputs_["image"] = inputs_["image"].permute(0, 3, 1, 2)
 
-# # use processor input temporarily
-# inputs_["image"] = inputs.data["image"]
-# inputs_["bbox"] = inputs.data["bbox"]
+# use processor input temporarily
+inputs_["image"] = inputs.data["image"]
+inputs_["bbox"] = inputs.data["bbox"]
 
-entity_dict = {'start': [entity[0] for entity in entities],
-        'end': [entity[1] for entity in entities],
-        'label': [entity[3] for entity in entities]}
+# entity_dict = {'start': [entity[0] for entity in entities],
+#         'end': [entity[1] for entity in entities],
+#         'label': [entity[3] + 1 for entity in entities]}
 
 with torch.no_grad():
   # inputs: {'input_ids', 'token_type_ids', 'attention_mask', 'bbox', 'image'}
-  outputs = relation_extraction_model(**inputs,
+  outputs = relation_extraction_model(**inputs_,
                                       entities=[entity_dict],
                                       relations=[{'start_index': [], 'end_index': [], 'head': [], 'tail': []}])
 
 # show predicted key-values
-for relation in outputs.pred_relations[0]:
-  head_start, head_end = relation['head']
-  tail_start, tail_end = relation['tail']
-  print("Question:", processor.decode(inputs.input_ids[0][head_start:head_end]))
-  print("Answer:", processor.decode(inputs.input_ids[0][tail_start:tail_end]))
-  print("----------")
-
 # for relation in outputs.pred_relations[0]:
 #   head_start, head_end = relation['head']
 #   tail_start, tail_end = relation['tail']
-#   print("Question:", tokenizer.decode(inputs_["input_ids"][0][head_start:head_end]))
-#   print("Answer:", tokenizer.decode(inputs_["input_ids"][0][tail_start:tail_end]))
+#   print("Question:", processor.decode(inputs.input_ids[0][head_start:head_end]))
+#   print("Answer:", processor.decode(inputs.input_ids[0][tail_start:tail_end]))
 #   print("----------")
+
+for relation in outputs.pred_relations[0]:
+  head_start, head_end = relation['head']
+  tail_start, tail_end = relation['tail']
+  print("Question:", tokenizer.decode(inputs_["input_ids"][0][head_start:head_end]))
+  print("Answer:", tokenizer.decode(inputs_["input_ids"][0][tail_start:tail_end]))
+  print("----------")
