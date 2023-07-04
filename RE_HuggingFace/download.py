@@ -109,11 +109,11 @@ class XFUN(datasets.GeneratorBasedBuilder):
         """Returns SplitGenerators."""
         return [
             datasets.SplitGenerator(
-                name=datasets.Split.TRAIN, gen_kwargs={"filepath": [ROOT / "dataset/en_sample/en.train.json",
-                                                                    ROOT / "dataset/en_sample/"]}),
+                name=datasets.Split.TRAIN, gen_kwargs={"filepath": ["/home/kewen_yang/Information_Extraction/dataset/RE_finetuning/train.json",
+                                                                    "/home/kewen_yang/Information_Extraction/dataset/RE_finetuning/"]}),
             datasets.SplitGenerator(
-                name=datasets.Split.VALIDATION, gen_kwargs={"filepath": [ROOT / "dataset/en_sample/en.val.json",
-                                                                         ROOT / "dataset/en_sample/"]}),
+                name=datasets.Split.VALIDATION, gen_kwargs={"filepath": ["/home/kewen_yang/Information_Extraction/dataset/RE_finetuning/val.json",
+                                                                         "/home/kewen_yang/Information_Extraction/dataset/RE_finetuning/"]}),
 
             # datasets.SplitGenerator(name=datasets.Split.TEST, gen_kwargs={"filepaths": test_files_for_many_langs}),
         ]
