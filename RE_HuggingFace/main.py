@@ -1,15 +1,22 @@
+import copy
 import enum
+from functools import reduce
 import json
 import logging
+from math import sqrt
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Union
+from typing import Dict, List, Optional, Union
 from PIL import Image, JpegImagePlugin
 from torch.utils.data import DataLoader
-
+from transformers import LayoutLMTokenizer
+import pandas as pd
+from codecarbon import track_emissions
+from codecarbon import EmissionsTracker
+import wandb
 JpegImagePlugin._getmp = lambda: None
 import matplotlib
 import tornado
@@ -20,9 +27,11 @@ import numpy as np
 import torch
 # enable only if using DGX machine to plot visuals
 from datasets import load_dataset
+
+
 from pytz import timezone
 from transformers import (AutoModelForTokenClassification, AutoProcessor,
-                          AutoTokenizer, LayoutLMForRelationExtraction,
+                          LayoutLMv2Tokenizer, LayoutLMForRelationExtraction,
                           LayoutLMv2FeatureExtractor,
                           LayoutLMv2ForRelationExtraction,
                           LayoutLMv2ForTokenClassification,
@@ -41,17 +50,18 @@ TZ = timezone('Asia/Singapore')
 CURRENT = datetime.now(tz=TZ)
 TIME = CURRENT.strftime("%Y_%m_%d_%H_%M")
 MODDEL_DIR = ROOT / "RE_HuggingFace" / f"model/checkpoint_{TIME}.pt"
-# DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DEVICE = "cpu"
+DEVICE = "cuda"
+# DEVICE = "cpu"
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-logger.addHandler(logging.StreamHandler(stream=sys.stdout))
-logger_path = ROOT / "RE_HuggingFace" / "artifacts" / f"experiment_{TIME}.log"
-fileHandler = logging.FileHandler(f"{logger_path.as_posix()}")
-logFormatter = logging.Formatter("[%(levelname)s] - %(message)s")
-fileHandler.setFormatter(logFormatter)
-logger.addHandler(fileHandler)
+
+@enum.unique
+class Task(enum.Enum):
+    FINETUNING = 0
+    INFERENCE = 1
+    XTRACT_INFER = 2
+
+
+task = Task.XTRACT_INFER
 
 
 @dataclass
@@ -120,6 +130,84 @@ class DataCollatorForKeyValueExtraction:
         return batch
 
 
+def relate_to_entity(to_merge: set, list_of_entities: list) -> list:
+    """
+    replace id with actual entity
+    Args:
+        to_merge: a set of all merging ids
+        list_of_entities: list of entities
+    Returns: list of entities to be merged, with no order
+    """
+    out = list()
+    for e in list_of_entities:
+        if e.get("id", "") in to_merge:
+            out.append(e)
+    return out
+
+
+def merge_two_entities(e_0: dict, e_1: dict) -> dict:
+    """
+    merge two entities
+    Args:
+        e_0: entity
+        e_1: entity
+    Returns: the combined entity
+    """
+    if "bbox" not in e_0.keys():
+        return e_1
+    if "bbox" not in e_1.keys():
+        return e_0
+
+    # decide the base entity
+    # compare the y0, smaller y0 -> base
+    if e_0["bbox"][1] == e_1["bbox"][1]:
+        if e_0["bbox"][0] <= e_1["bbox"][0]:
+            base_entity = e_0
+            adding_entity = e_1
+        else:
+            base_entity = e_1
+            adding_entity = e_0
+    elif e_0["bbox"][1] < e_1["bbox"][1]:
+        base_entity = e_0
+        adding_entity = e_1
+    else:
+        base_entity = e_1
+        adding_entity = e_0
+
+    base_entity = merge_text(base_entity, adding_entity)
+    base_entity = merge_bbox(base_entity, adding_entity)
+    return base_entity
+
+
+def merge_text(base_entity: dict, adding_entity: dict) -> dict:
+    """
+    merge text from two entities
+    Args:
+        base_entity: the entity that text starts
+        adding_entity: the entity to be added to base
+    Returns: an entity with combined text
+    """
+    base_entity["text"] = base_entity.get("text", "") + " " + adding_entity.get("text", "")
+    return base_entity
+
+
+def merge_bbox(base_entity: dict, adding_entity: dict) -> dict:
+    """
+    merge bbox from two entities
+    Args:
+        base_entity: the entity that bbox starts
+        adding_entity: the entity to be added to base
+    Returns: an entity with combined bbox
+    """
+    base_entity["bbox"] = [
+        min(base_entity["bbox"][0], adding_entity["bbox"][0]),
+        min(base_entity["bbox"][1], adding_entity["bbox"][1]),
+        max(base_entity["bbox"][2], adding_entity["bbox"][2]),
+        max(base_entity["bbox"][3], adding_entity["bbox"][3])
+    ]
+    return base_entity
+
+
 def unnormalize_box(bbox, width, height):
     return [
          width * (bbox[0] / 1000),
@@ -135,80 +223,247 @@ def compute_metrics(p):
     return score
 
 
-@enum.unique
-class Task(enum.Enum):
-    FINETUNING = 0
-    INFERENCE = 1
-    CUST_INFER = 2
+def post_process_entities(entity_list: list, threshold: int = 2) -> tuple:
+    """
+    perform some cleaning and format changing task on entity_list
+    Args:
+        entity_list: all the entities after pairing step
+        threshold: the largest vertical difference between two merging entities
+        if diff > threshold, then no merge for these two entities.
+    Returns:
+    """
+    # relation diagram to illustrate multi-key and multi-val linking
+    # Given key_0 and key_1 form a key, and its corresponding val is formed by val_0, val_1 and val_2,
+    # their linking relation could be as below:
+    #      / val_0        / val_0
+    # key_0- val_1   key_1- val_1    val_0 - key_1, val_1 - key_1, val_2 - key_1
+    #      \ val_2        \ val_2
+    # caveat: for the linking in value entity, it only shows key_1 instead of key_1 and key_2
 
+    # remove entities without any linking, and change key "box" to "bbox"
+    unpaired = list()
+    en_list_ori = copy.deepcopy(entity_list)
+    for idx, entity in enumerate(en_list_ori):
+        if "id" not in entity.keys():
+            unpaired.append(idx)
+            continue
 
-task = Task.FINETUNING
+        # change id type to str
+        entity["id"] = str(entity["id"])
+
+        # remove invalid entity
+        if "linking" not in entity.keys() or len(entity["linking"]) == 0:
+            unpaired.append(idx)
+            continue
+
+    entity_list = [i for idx, i in enumerate(en_list_ori) if idx not in unpaired]
+    if len(unpaired) != 0:
+        unpaired = [i for idx, i in enumerate(en_list_ori) if idx in unpaired]
+
+    # all entities in the list should have "id" and "linking" keys afterwards
+    merge_list = list()
+    kv_indexes = [e["id"] for e in entity_list]
+
+    def append_merge_set(merge_list: list,
+                         merge_set: set) -> list:
+        """
+        append merge_set to merge_list
+        Args:
+            merge_list: merge_list
+            merge_set: merge_set
+        Returns: list
+        """
+        if len(merge_list) == 0:
+            merge_list.append(merge_set)
+            return merge_list
+
+        if merge_set in merge_list:
+            return merge_list
+
+        # there is overlaps between existing and merge_set
+        for i in merge_list:
+            if len(i.union(merge_set)) < len(i) + len(merge_set):
+                i.update(merge_set)
+                return merge_list
+
+        merge_list.append(merge_set)
+        return merge_list
+
+    def get_counterpart(link: List, entity: Dict) -> str:
+        # get the counterpart from a link
+        if len(link) != 2:
+            raise ValueError("link is not between 2 entities")
+
+        id = entity["id"]
+        for i in link:
+            if str(i) != id:
+                return str(i)
+
+    # merge answers linked to the same question
+    for entity in entity_list:
+        # find the question entity which links multiple answers
+        if entity.get("label", "") == "question" and len(entity["linking"]) > 1:
+            merge_set = set()
+            for link in entity["linking"]:
+                cp = get_counterpart(link, entity)
+                if cp in kv_indexes:
+                    merge_set.add(cp)
+
+            if len(merge_set) >= 2:
+                merge_list = append_merge_set(merge_list, merge_set)
+
+    # merge questions with same linkings
+    # for temp_dict, key: sorted list of counterparts; value: question id
+    temp_dict = defaultdict(lambda: set())
+    for idx, entity in enumerate(entity_list):
+        if entity.get("label", "") == "question":
+            cps = sorted([get_counterpart(i, entity) for i in entity["linking"]])
+            temp_dict[tuple(cps)].add(entity["id"])
+
+    # add ids of merging keys to merge_list
+    for q_ids in temp_dict.values():
+        if len(q_ids) > 1:
+            merge_list = append_merge_set(merge_list, q_ids)
+
+    if len(merge_list) > 0:
+        for merge_set in merge_list:
+            en_list = relate_to_entity(to_merge=merge_set, list_of_entities=entity_list)
+
+            # filter the big gap in merge list
+            en_list = sorted(en_list, key=lambda x: (x["bbox"][1], x["bbox"][0]))
+            for idx in range(len(en_list) - 1):
+                y_diff = en_list[idx + 1]["bbox"][1] - en_list[idx]["bbox"][3]
+                char_height = abs(en_list[idx]["bbox"][3] - en_list[idx]["bbox"][1])
+                if y_diff > threshold * char_height:
+                    # stop merging at idx, **Noted that all entities are sorted by y0
+                    en_list = en_list[:(idx + 1)]
+                    break
+            base = reduce(merge_two_entities, en_list)
+            # add base and drop entities in merge_set
+            entity_list = [e for e in entity_list if e.get('id', -1) not in merge_set]
+            entity_list.append(base)
+
+    # update valid ids
+    kv_indexes = [e["id"] for e in entity_list]
+
+    # change linking from list to single index
+    for entity in entity_list:
+        if len(entity["linking"]) == 1:
+            entity["linking"] = get_counterpart(entity["linking"][0], entity)
+        else:
+            for link in entity["linking"]:
+                index = get_counterpart(link, entity)
+                if index in kv_indexes:
+                    entity["linking"] = index
+                    break
+
+    keyvalue = [e for e in entity_list if isinstance(e["linking"], str)]
+    return keyvalue, unpaired
+
 
 if task.name == "FINETUNING":
 
-  dataset = load_dataset(path=(ROOT / "RE_HuggingFace" / "download.py").as_posix(), name="en")
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+    logger.addHandler(logging.StreamHandler(stream=sys.stdout))
+    logger_path = ROOT / "RE_HuggingFace" / "artifacts" / f"experiment_{TIME}.log"
+    fileHandler = logging.FileHandler(f"{logger_path.as_posix()}")
+    logFormatter = logging.Formatter("[%(levelname)s] - %(message)s")
+    fileHandler.setFormatter(logFormatter)
+    logger.addHandler(fileHandler)
 
-  model = LayoutLMv2ForRelationExtraction.from_pretrained("microsoft/layoutlmv2-base-uncased")
-  tokenizer = AutoTokenizer.from_pretrained("microsoft/layoutlmv2-base-uncased")
+    with EmissionsTracker() as tracker:
+        # start a new wandb run to track this script
+        wandb.init(
+            # set the wandb project where this run will be logged
+            project="RE",
 
-  # tokenizer = AutoTokenizer.from_pretrained(ROOT / "RE_HuggingFace/model/checkpoint_2023_06_06_14_17.pt/checkpoint-5000")
-  # # model = LayoutLMv2ForRelationExtraction.from_pretrained("microsoft/layoutlmv2-base-uncased")
-  # model = LayoutLMv2ForRelationExtraction.from_pretrained(ROOT / "RE_HuggingFace/model/checkpoint_2023_06_06_14_17.pt/checkpoint-5000")
+            # track hyperparameters and run metadata
+            config={
+            "dataset": "1st Batch",
+            }
+        )
 
-  # model = LayoutLMForRelationExtraction.from_pretrained("microsoft/layoutlm-base-uncased")
-  # tokenizer = AutoTokenizer.from_pretrained("microsoft/layoutlm-base-uncased")
+        dataset = load_dataset(path=(ROOT / "RE_HuggingFace" / "download.py").as_posix(), name="en")
 
-  feature_extractor = LayoutLMv2FeatureExtractor(apply_ocr=False)
+        # # check if any bbox value > 1000, use it only for debugging >1000 error
+        # for i in range(len(dataset["train"]["bbox"])):
+        #   print(max(torch.tensor(dataset["train"]["bbox"][i])[:, 1]))
 
-  data_collator = DataCollatorForKeyValueExtraction(
-      feature_extractor,
-      tokenizer,
-      pad_to_multiple_of=1,
-      padding="max_length",
-      max_length=512,
-  )
+        model_card = "/home/kewen_yang/Information_Extraction/RE_HuggingFace/model/checkpoint_2023_07_13_17_37.pt"
+        # model_card = "microsoft/layoutlmv2-base-uncased"
+        # model_card = "/home/kewen_yang/Information_Extraction/RE_HuggingFace/model/checkpoint_2023_07_13_09_56.pt/checkpoint-2000"
 
-  train_dataset = dataset['train']
-  val_dataset = dataset['validation']
+        model = LayoutLMForRelationExtraction.from_pretrained(model_card)
+        tokenizer = LayoutLMTokenizer.from_pretrained(model_card)
 
-  dataloader = DataLoader(train_dataset, batch_size=1, collate_fn=data_collator)
+        logger.info(f"finetuning model on top of {model_card}")
 
-  # Define TrainingArguments
-  # See thread for hyperparameters: https://github.com/microsoft/unilm/issues/586
-  training_args = TrainingArguments(output_dir=MODDEL_DIR,
-                                    overwrite_output_dir=True,
-                                    remove_unused_columns=False,
-                                    # fp16=True, -> led to a loss of 0
-                                    num_train_epochs=1,
-                                    # max_steps=5000,
-                                    no_cuda=False,
-                                    per_device_train_batch_size=2,
-                                    per_device_eval_batch_size=1,
-                                    warmup_ratio=0.1,
-                                    learning_rate=1e-5,
-                                    push_to_hub=False,
-                                    )
+        feature_extractor = LayoutLMv2FeatureExtractor(apply_ocr=False)
 
-  # Initialize our Trainer
-  trainer = XfunReTrainer(
-      model=model,
-      args=training_args,
-      train_dataset=train_dataset,
-      eval_dataset=val_dataset,
-      tokenizer=tokenizer,
-      data_collator=data_collator,
-      compute_metrics=compute_metrics,
-  )
+        data_collator = DataCollatorForKeyValueExtraction(
+            feature_extractor,
+            tokenizer,
+            pad_to_multiple_of=1,
+            padding="max_length",
+            max_length=512,
+        )
 
-  logger.info("start training model")
-  train_metrics = trainer.train()
-  logger.info(f"training_metrics: {train_metrics}")
+        train_dataset = dataset['train']
+        val_dataset = dataset['validation']
 
-  logger.info("start evaluating performance")
-  eval_metrics = trainer.evaluate()
-  logger.info(f"evaluation metrics: {eval_metrics}")
+        dataloader = DataLoader(train_dataset, batch_size=1, collate_fn=data_collator)
+
+        # Define TrainingArguments
+        # See thread for hyperparameters: https://github.com/microsoft/unilm/issues/586
+        training_args = TrainingArguments(
+            output_dir="/home/kewen_yang/Information_Extraction/RE_HuggingFace/model/checkpoint_2023_07_13_17_37.pt",
+            overwrite_output_dir=True,
+            remove_unused_columns=False,
+            # fp16=True, -> led to a loss of 0
+
+            max_steps=1000 + 5000 + 5000 + 5000,
+            evaluation_strategy="steps",
+
+            # num_train_epochs=1,
+            # evaluation_strategy="epoch",
+
+            no_cuda=(DEVICE == "cpu"),
+            per_device_train_batch_size=2,
+            per_device_eval_batch_size=1,
+            warmup_ratio=0.1,
+            learning_rate=1e-5,
+            push_to_hub=False,
+            report_to="wandb"
+            )
+
+        # Initialize our Trainer
+        trainer = XfunReTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=val_dataset,
+            tokenizer=tokenizer,
+            data_collator=data_collator,
+            compute_metrics=compute_metrics,
+        )
+        logger.info("start training model")
+        train_metrics = trainer.train(resume_from_checkpoint=True)
+        logger.info(f"training_metrics: {train_metrics}")
+
+        logger.info("start evaluating performance")
+        eval_metrics = trainer.evaluate()
+        logger.info(f"evaluation metrics: {eval_metrics}")
+        trainer.save_model("/home/kewen_yang/Information_Extraction/RE_HuggingFace/model/checkpoint_2023_07_13_17_37.pt")
+
+        learning_curve = pd.DataFrame(trainer.state.log_history)
+        logger.info('\n\t' + learning_curve.to_string().replace('\n', '\n\t'))
+
 
 elif task.name == "INFERENCE":
+  """do inference by huggingface pipeline
+  """
+
   # test_image = train_dataset[48]['original_image']
   test_image = Image.open(ROOT / 'dataset/test/AUTOVACSTORE-1-2-Bing-image_010.jpg')
   # plt.imshow(test_image)
@@ -221,134 +476,232 @@ elif task.name == "INFERENCE":
   # we set `return_offsets_mapping=True` as we use the offsets to know which tokens are subwords and which aren't
   inputs = processor(test_image, return_offsets_mapping=True, padding="max_length", max_length=512, truncation=True, return_tensors="pt")
 
-  # original_text = processor.tokenizer.convert_tokens_to_string([processor.tokenizer.decode(i, skip_special_tokens=True) for i in inputs["input_ids"][0].tolist()])
-  # # all_token_text = [processor.tokenizer.decode(i, skip_special_tokens=True) for i in inputs["input_ids"][0].tolist()]
+  original_text = processor.tokenizer.convert_tokens_to_string([processor.tokenizer.decode(i, skip_special_tokens=True) for i in inputs["input_ids"][0].tolist()])
+  # all_token_text = [processor.tokenizer.decode(i, skip_special_tokens=True) for i in inputs["input_ids"][0].tolist()]
 
-  # inputs = inputs.to(DEVICE)
-  # model.to(DEVICE)
+  inputs = inputs.to(DEVICE)
+  model.to(DEVICE)
 
-  # # offset_mapping: indicates the start and end index of the actual subword w.r.t each token text, e.g. '##omi' with offset [2, 5] -> 'omi'
-  # offset_mapping = inputs.pop("offset_mapping")
+  # offset_mapping: indicates the start and end index of the actual subword w.r.t each token text, e.g. '##omi' with offset [2, 5] -> 'omi'
+  offset_mapping = inputs.pop("offset_mapping")
 
-  # # word_ids: indicates if the subtokens belong to the same word.
-  # word_ids = inputs.encodings[0].word_ids
+  # word_ids: indicates if the subtokens belong to the same word.
+  word_ids = inputs.encodings[0].word_ids
 
-  # token_ids = inputs.input_ids[0].tolist()
+  token_ids = inputs.input_ids[0].tolist()
 
-  # if_special = inputs.encodings[0].special_tokens_mask
+  if_special = inputs.encodings[0].special_tokens_mask
 
-  # # forward pass
-  # with torch.no_grad():
-  #   outputs = model(**inputs)
+  # forward pass
+  with torch.no_grad():
+    outputs = model(**inputs)
 
-  # # take argmax on last dimension to get predicted class ID per token
-  # predictions = outputs.logits.argmax(-1).squeeze().tolist()
+  # take argmax on last dimension to get predicted class ID per token
+  predictions = outputs.logits.argmax(-1).squeeze().tolist()
 
-  # # # check if it's subwords
-  # # is_subword = np.array(offset_mapping.squeeze().tolist())[:, 0] != 0
+  # # check if it's subwords
+  # is_subword = np.array(offset_mapping.squeeze().tolist())[:, 0] != 0
 
-  # # merge subwords into word-level based on word_ids
-  # word_pred = defaultdict(lambda: -1)
-  # words = defaultdict(list)
-  # for idx, tp in enumerate(zip(if_special, token_ids, predictions, word_ids)):
-  #   if idx == 0 or bool(tp[0]):
-  #     continue
+  # merge subwords into word-level based on word_ids
+  word_pred = defaultdict(lambda: -1)
+  words = defaultdict(list)
+  for idx, tp in enumerate(zip(if_special, token_ids, predictions, word_ids)):
+    if idx == 0 or bool(tp[0]):
+      continue
 
-  #   words[tp[-1]].append(idx)
-  #   if word_pred[tp[-1]] == -1:
-  #     word_pred[tp[-1]] = tp[2]
+    words[tp[-1]].append(idx)
+    if word_pred[tp[-1]] == -1:
+      word_pred[tp[-1]] = tp[2]
 
-  # id2label = {"QUESTION": 0, "ANSWER": 1}
+  id2label = {"QUESTION": 1, "ANSWER": 2}
 
-  # # finally, store recognized "question" and "answer" entities in a list
-  # entities = []
-  # current_entity = None
-  # start = None
-  # end = None
+  # finally, store recognized "question" and "answer" entities in a list
+  entities = []
+  current_entity = None
+  start = None
+  end = None
 
-  # for idx, (id, pred) in enumerate(zip(words.values(), word_pred.values())):
-  #   predicted_label = model.config.id2label[pred]
-  #   if predicted_label == "O":
-  #       continue
+  for idx, (id, pred) in enumerate(zip(words.values(), word_pred.values())):
+    predicted_label = model.config.id2label[pred]
+    if predicted_label == "O":
+        continue
 
-  #   if predicted_label.startswith("B") and current_entity is None:
-  #     # means we're at the start of a new entity
-  #     current_entity = predicted_label.replace("B-", "")
-  #     start = min(id)
-  #     print(f"--------------New entity: at index {start}", current_entity)
+    if predicted_label.startswith("B") and current_entity is None:
+      # means we're at the start of a new entity
+      current_entity = predicted_label.replace("B-", "")
+      start = min(id)
+      print(f"--------------New entity: at index {start}", current_entity)
 
-  #   if current_entity is not None and current_entity not in predicted_label:
-  #     # means we're at the end of a new entity
-  #     end = max(words[idx - 1])
-  #     print("---------------End of new entity")
-  #     entities.append((start, end, current_entity, id2label[current_entity]))
-  #     current_entity = None
+    if current_entity is not None and current_entity not in predicted_label:
+      # means we're at the end of a new entity
+      end = max(words[idx - 1])
+      print("---------------End of new entity")
+      entities.append((start, end, current_entity, id2label[current_entity]))
+      current_entity = None
 
-  #     if predicted_label.startswith("B") and current_entity is None:
-  #       # means we're at the start of a new entity
-  #       current_entity = predicted_label.replace("B-", "")
-  #       start = min(id)
-  #       print(f"--------------New entity: at index {start}", current_entity)
+      if predicted_label.startswith("B") and current_entity is None:
+        # means we're at the start of a new entity
+        current_entity = predicted_label.replace("B-", "")
+        start = min(id)
+        print(f"--------------New entity: at index {start}", current_entity)
 
-  # # step 2: run LayoutLMv2ForRelationExtraction
-  # entity_dict = {'start': [entity[0] for entity in entities],
-  #         'end': [entity[1] for entity in entities],
-  #         'label': [entity[3] + 1 for entity in entities]}
+  # step 2: run LayoutLMv2ForRelationExtraction
+  entity_dict = {'start': [entity[0] for entity in entities],
+          'end': [entity[1] for entity in entities],
+          'label': [entity[3] for entity in entities]}
 
-  # relation_extraction_model = LayoutLMv2ForRelationExtraction.from_pretrained("RE_HuggingFace/model/checkpoint_2023_06_22_11_48.pt/checkpoint-5000")
-  # # relation_extraction_model = LayoutLMv2ForRelationExtraction.from_pretrained("nielsr/layoutxlm-finetuned-xfund-fr-re")
-  # relation_extraction_model.to(DEVICE)
-
-  # with torch.no_grad():
-  #   # inputs: {'input_ids', 'token_type_ids', 'attention_mask', 'bbox', 'image'}
-  #   outputs = relation_extraction_model(**inputs,
-  #                                       entities=[entity_dict],
-  #                                       relations=[{'start_index': [], 'end_index': [], 'head': [], 'tail': []}])
-
-  # # show predicted key-values
-  # for relation in outputs.pred_relations[0]:
-  #   head_start, head_end = relation['head']
-  #   tail_start, tail_end = relation['tail']
-  #   print("Question:", processor.decode(inputs.input_ids[0][head_start:head_end]))
-  #   print("Answer:", processor.decode(inputs.input_ids[0][tail_start:tail_end]))
-  #   print("----------")
-
-elif task.name == "CUST_INFER":
-  relation_extraction_model = LayoutLMv2ForRelationExtraction.from_pretrained(ROOT / "RE_HuggingFace/model/checkpoint_2023_06_30_13_44.pt/checkpoint-5000")
+  relation_extraction_model = LayoutLMv2ForRelationExtraction.from_pretrained("/home/kewen_yang/Information_Extraction/RE_HuggingFace/model/checkpoint_2023_07_11_15_49.pt/checkpoint-5000")
   # relation_extraction_model = LayoutLMv2ForRelationExtraction.from_pretrained("nielsr/layoutxlm-finetuned-xfund-fr-re")
   relation_extraction_model.to(DEVICE)
 
-  with open(ROOT / "dataset" / "AUTOVACSTORE-1-2-Bing-image_010.json", "rb") as f:
-    file = json.load(f)
-  tokenizer = AutoTokenizer.from_pretrained("microsoft/layoutlm-base-uncased")
-  entity_dict = file["entity_dict"]
-  entity_dict["label"] = [i + 1 for i in entity_dict["label"]]
-  inputs_ = file["input"]
-
-  for k, v in inputs_.items():
-    inputs_[k] = torch.tensor(inputs_[k])
-
-  inputs_["image"] = inputs_["image"].permute(0, 3, 1, 2)
-
-  # use processor input temporarily
-  inputs_["image"] = inputs.data["image"]
-  inputs_["bbox"] = inputs.data["bbox"]
-
   with torch.no_grad():
     # inputs: {'input_ids', 'token_type_ids', 'attention_mask', 'bbox', 'image'}
-    outputs = relation_extraction_model(**inputs_,
+    outputs = relation_extraction_model(**inputs,
                                         entities=[entity_dict],
                                         relations=[{'start_index': [], 'end_index': [], 'head': [], 'tail': []}])
 
-
+  # show predicted key-values
   for relation in outputs.pred_relations[0]:
     head_start, head_end = relation['head']
     tail_start, tail_end = relation['tail']
-    print("Question:", tokenizer.decode(inputs_["input_ids"][0][head_start:head_end]))
-    print("Answer:", tokenizer.decode(inputs_["input_ids"][0][tail_start:tail_end]))
+    print("Question:", processor.decode(inputs.input_ids[0][head_start:head_end]))
+    print("Answer:", processor.decode(inputs.input_ids[0][tail_start:tail_end]))
     print("----------")
 
+elif task.name == "XTRACT_INFER":
+  """do inference by Xtract customized pipeline
+  """
+  print("run inferencing ...")
+#   relation_extraction_model = LayoutLMForRelationExtraction.from_pretrained("/home/kewen_yang/Information_Extraction/RE_HuggingFace/model/checkpoint_2023_07_13_17_37.pt")
+  relation_extraction_model = LayoutLMv2ForRelationExtraction.from_pretrained("/home/kewen_yang/Information_Extraction/RE_HuggingFace/model/checkpoint_2023_07_12_14_54.pt")
+  relation_extraction_model.to(DEVICE)
+  tokenizer = LayoutLMTokenizer.from_pretrained("/home/kewen_yang/Information_Extraction/RE_HuggingFace/model/checkpoint_2023_07_12_14_54.pt")
 
+  with open(ROOT / "dataset/test/AUTOVACSTORE-1-2-Bing-image_010.json", "rb") as f:
+    file = json.load(f)
+
+  entity_dict = file["entity_dict"]
+  entity_dict["label"] = [i for i in entity_dict["label"]]
+  inputs = file["input"]
+
+  # # load image
+  test_image = Image.open(ROOT / 'dataset/test/AUTOVACSTORE-1-2-Bing-image_010.jpg')
+  # rescale image as RE model requires 224 x 224
+  test_image = test_image.resize((224, 224), resample=Image.Resampling.BILINEAR)
+  test_image = np.array(test_image)
+  # channel first
+  test_image = test_image.transpose(2, 0, 1)
+  # flip color channels from RGB to BGR (as Detectron2 requires this)
+  test_image = test_image[::-1, :, :]
+
+  inputs["image"] = [test_image]
+  print("----------------------------entities----------------------------------------")
+  print(f'questions: {[tokenizer.decode([i for i in inputs["input_ids"][0][s:e]]) for s, e, l in zip(entity_dict["start"], entity_dict["end"], entity_dict["label"]) if l == 1]}')
+  print(f'answers: {[tokenizer.decode([i for i in inputs["input_ids"][0][s:e]]) for s, e, l in zip(entity_dict["start"], entity_dict["end"], entity_dict["label"]) if l == 2]}')
+  print("----------------------------------------------------------------------------")
+
+  for k, v in inputs.items():
+    inputs[k] = torch.tensor(inputs[k])
+
+  inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+
+  with torch.no_grad():
+    # inputs: {'input_ids', 'token_type_ids', 'attention_mask', 'bbox', 'image'}
+    outputs = relation_extraction_model(**inputs,
+                                        entities=[entity_dict],
+                                        relations=[{'start_index': [], 'end_index': [], 'head': [], 'tail': []}])
+
+  res = defaultdict(list)
+  done = set()
+  for relation in outputs.pred_relations[0]:
+    head_start, head_end = relation['head']
+    tail_start, tail_end = relation['tail']
+    key_d = {}
+    key_d["id"] = relation["head_id"]
+    key_d["text"] = tokenizer.decode(inputs['input_ids'][0][head_start:head_end])
+    key_d["label"] = "question"
+    key_d["bbox"] = torch.cat((inputs['bbox'][0][head_start:head_end].min(0).values[:2], inputs['bbox'][0][head_start:head_end].max(0).values[2:]), 0).tolist()
+    key_d["linking"] = [[relation['head_id'], relation['tail_id']]]
+    res[relation["head_id"]].append(key_d)
+    done.add(key_d["id"])
+    print(f"Question: {key_d['text']}")
+
+    val_d = {}
+    val_d["id"] = relation["tail_id"]
+    val_d["text"] = tokenizer.decode(inputs['input_ids'][0][tail_start:tail_end])
+    val_d["label"] = "answer"
+    val_d["bbox"] = torch.cat((inputs['bbox'][0][tail_start:tail_end].min(0).values[:2], inputs['bbox'][0][tail_start:tail_end].max(0).values[2:]), 0).tolist()
+    val_d["linking"] = [[relation['head_id'], relation['tail_id']]]
+    res[relation["tail_id"]].append(val_d)
+    done.add(val_d["id"])
+    print(f"Answer:, {val_d['text']}")
+    print("----------")
+
+  # remove duplicates
+  def remove_dup(lst):
+    if len(lst) == 1:
+      return lst[0]
+
+    out = lst.pop(0)
+    for e in lst:
+      out["linking"].append(copy.deepcopy(e["linking"][0]))
+
+    return out
+
+  def get_potential_que(avail_qns, ans, res):
+      if len(avail_qns) == 1:
+          return None
+
+      qns = [res[id] for id in avail_qns]
+      out = qns.pop(0)
+      dis = sqrt((ans["bbox"][0] - out["bbox"][2])**2 + (ans["bbox"][3] - out["bbox"][3])**2)
+      for q in qns:
+          if dis >= sqrt((ans["bbox"][0] - q["bbox"][2])**2 + (ans["bbox"][3] - q["bbox"][3])**2):
+              out = q
+              dis = sqrt((ans["bbox"][0] - q["bbox"][2])**2 + (ans["bbox"][3] - q["bbox"][3])**2)
+
+      return out
+
+  res = {k: remove_dup(v) for k, v in res.items()}
+  # remove links based on distance
+  for i in res.keys():
+      if res[i]['label'] == "question":
+          continue
+
+      avail_qs = [l[0] for l in res[i]["linking"]]
+      qns = get_potential_que(avail_qs, res[i], res)
+      if qns is not None:
+          res[i]["linking"] = [[int(qns["id"]), int(res[i]["id"])]]
+          res[qns["id"]]["linking"] = [[int(qns["id"]), int(res[i]["id"])]]
+
+  for i in res.keys():
+      if res[i]["label"] == "question" and len(res[i]["linking"]) > 1:
+
+          drops = list()
+          for l in res[i]["linking"]:
+              if res[l[1]]["linking"][0][0] != i:
+                  drops.append(l)
+
+          if drops:
+              for l in drops:
+                  res[i]["linking"].remove(l)
+
+  res = list(res.values())
+
+  keyvalue, unpaired = post_process_entities(res)
+
+  out = {"keyvalue": keyvalue, "unpaired": unpaired}
+
+  # print key value text
+  printable = {e["id"]: e for e in out["keyvalue"]}
+  print("Extracted Key-value pairs are:")
+  for e in printable.values():
+      if e["label"] == "question":
+          print(f'{e["text"]}:{printable[e["linking"]]["text"]}')
+
+  with open("/home/kewen_yang/Information_Extraction/dataset/RE_res/1.json", 'w') as f:
+      json.dump(out, f)
+  print()
 
 ################################################ Appendix ################################################
 """
