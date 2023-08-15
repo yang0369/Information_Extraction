@@ -4,6 +4,7 @@ from functools import reduce
 import json
 import logging
 from math import sqrt
+import os
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
@@ -14,8 +15,6 @@ from PIL import Image, JpegImagePlugin
 from torch.utils.data import DataLoader
 from transformers import LayoutLMTokenizer
 import pandas as pd
-from codecarbon import track_emissions
-from codecarbon import EmissionsTracker
 import wandb
 JpegImagePlugin._getmp = lambda: None
 import matplotlib
@@ -31,11 +30,8 @@ from datasets import load_dataset
 
 from pytz import timezone
 from transformers import (AutoModelForTokenClassification, AutoProcessor,
-                          LayoutLMv2Tokenizer, LayoutLMForRelationExtraction,
-                          LayoutLMv2FeatureExtractor,
-                          LayoutLMv2ForRelationExtraction,
-                          LayoutLMv2ForTokenClassification,
-                          LayoutLMv2Processor, PreTrainedTokenizerBase,
+                          LayoutLMForRelationExtraction,
+                          PreTrainedTokenizerBase,
                           TrainingArguments)
 from transformers.file_utils import PaddingStrategy
 
@@ -90,17 +86,13 @@ class DataCollatorForKeyValueExtraction:
         label_pad_token_id (:obj:`int`, `optional`, defaults to -100):
             The id to use when padding the labels (-100 will be automatically ignore by PyTorch loss functions).
     """
-    feature_extractor: LayoutLMv2FeatureExtractor
-    tokenizer: PreTrainedTokenizerBase
+    tokenizer: PreTrainedTokenizerBase()
     padding: Union[bool, str, PaddingStrategy] = True
     max_length: Optional[int] = None
     pad_to_multiple_of: Optional[int] = None
     label_pad_token_id: int = -100
 
     def __call__(self, features):
-        # prepare image input
-        image = self.feature_extractor([feature["original_image"] for feature in features], return_tensors="pt").pixel_values
-
         # prepare text input
         entities = []
         relations = []
@@ -123,7 +115,7 @@ class DataCollatorForKeyValueExtraction:
             return_tensors="pt"
         )
 
-        batch["image"] = image
+        # batch["image"] = image
         batch["entities"] = entities
         batch["relations"] = relations
 
@@ -372,92 +364,86 @@ if task.name == "FINETUNING":
     fileHandler.setFormatter(logFormatter)
     logger.addHandler(fileHandler)
 
-    with EmissionsTracker() as tracker:
-        # start a new wandb run to track this script
-        wandb.init(
-            # set the wandb project where this run will be logged
-            project="RE",
+    # start a new wandb run to track this script
+    wandb.init(
+        # set the wandb project where this run will be logged
+        project="RE",
 
-            # track hyperparameters and run metadata
-            config={
-            "dataset": "1st Batch",
-            }
+        # track hyperparameters and run metadata
+        config={
+        "dataset": "RE_FUNSD",
+        }
+    )
+
+    dataset = load_dataset(path=(ROOT / "RE_HuggingFace" / "download.py").as_posix(), name="en")
+
+    # # check if any bbox value > 1000, use it only for debugging >1000 error
+    # for i in range(len(dataset["train"]["bbox"])):
+    #   print(max(torch.tensor(dataset["train"]["bbox"][i])[:, 1]))
+
+    model_card = "/home/kewen_yang/Information_Extraction/RE_HuggingFace/model/checkpoint_2023_08_01_15_26.pt"
+    # model_card = "microsoft/layoutlm-base-uncased"
+
+    model = LayoutLMForRelationExtraction.from_pretrained(model_card)
+    tokenizer = LayoutLMTokenizer.from_pretrained(model_card)
+
+    logger.info(f"finetuning model on top of {model_card}")
+    logger.info(f"finetuning with dataset - RE_Finetune_1")
+    data_collator = DataCollatorForKeyValueExtraction(
+        tokenizer,
+        pad_to_multiple_of=1,
+        padding="max_length",
+        max_length=512,
+    )
+
+    train_dataset = dataset['train']
+    val_dataset = dataset['validation']
+
+    # Define TrainingArguments
+    # See thread for hyperparameters: https://github.com/microsoft/unilm/issues/586
+    training_args = TrainingArguments(
+        output_dir=MODDEL_DIR,
+        overwrite_output_dir=True,
+        remove_unused_columns=False,
+        # fp16=True, -> led to a loss of 0
+
+        max_steps=20000,
+        # max_steps = 10,
+        evaluation_strategy="steps",
+
+        # num_train_epochs=1,
+        # evaluation_strategy="epoch",
+        save_strategy="no",
+        no_cuda=(DEVICE == "cpu"),
+        per_device_train_batch_size=2,
+        per_device_eval_batch_size=1,
+        warmup_ratio=0.1,
+        learning_rate=1e-5,
+        push_to_hub=False,
+        report_to="wandb"
         )
 
-        dataset = load_dataset(path=(ROOT / "RE_HuggingFace" / "download.py").as_posix(), name="en")
+    # Initialize our Trainer
+    trainer = XfunReTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+        compute_metrics=compute_metrics,
+    )
+    logger.info("start training model")
+    train_metrics = trainer.train(resume_from_checkpoint=False)
+    logger.info(f"training_metrics: {train_metrics}")
 
-        # # check if any bbox value > 1000, use it only for debugging >1000 error
-        # for i in range(len(dataset["train"]["bbox"])):
-        #   print(max(torch.tensor(dataset["train"]["bbox"][i])[:, 1]))
+    logger.info("start evaluating performance")
+    eval_metrics = trainer.evaluate()
+    logger.info(f"evaluation metrics: {eval_metrics}")
+    trainer.save_model(MODDEL_DIR)
 
-        model_card = "/home/kewen_yang/Information_Extraction/RE_HuggingFace/model/checkpoint_2023_07_13_17_37.pt"
-        # model_card = "microsoft/layoutlmv2-base-uncased"
-        # model_card = "/home/kewen_yang/Information_Extraction/RE_HuggingFace/model/checkpoint_2023_07_13_09_56.pt/checkpoint-2000"
-
-        model = LayoutLMForRelationExtraction.from_pretrained(model_card)
-        tokenizer = LayoutLMTokenizer.from_pretrained(model_card)
-
-        logger.info(f"finetuning model on top of {model_card}")
-
-        feature_extractor = LayoutLMv2FeatureExtractor(apply_ocr=False)
-
-        data_collator = DataCollatorForKeyValueExtraction(
-            feature_extractor,
-            tokenizer,
-            pad_to_multiple_of=1,
-            padding="max_length",
-            max_length=512,
-        )
-
-        train_dataset = dataset['train']
-        val_dataset = dataset['validation']
-
-        dataloader = DataLoader(train_dataset, batch_size=1, collate_fn=data_collator)
-
-        # Define TrainingArguments
-        # See thread for hyperparameters: https://github.com/microsoft/unilm/issues/586
-        training_args = TrainingArguments(
-            output_dir="/home/kewen_yang/Information_Extraction/RE_HuggingFace/model/checkpoint_2023_07_13_17_37.pt",
-            overwrite_output_dir=True,
-            remove_unused_columns=False,
-            # fp16=True, -> led to a loss of 0
-
-            max_steps=1000 + 5000 + 5000 + 5000,
-            evaluation_strategy="steps",
-
-            # num_train_epochs=1,
-            # evaluation_strategy="epoch",
-
-            no_cuda=(DEVICE == "cpu"),
-            per_device_train_batch_size=2,
-            per_device_eval_batch_size=1,
-            warmup_ratio=0.1,
-            learning_rate=1e-5,
-            push_to_hub=False,
-            report_to="wandb"
-            )
-
-        # Initialize our Trainer
-        trainer = XfunReTrainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_dataset,
-            eval_dataset=val_dataset,
-            tokenizer=tokenizer,
-            data_collator=data_collator,
-            compute_metrics=compute_metrics,
-        )
-        logger.info("start training model")
-        train_metrics = trainer.train(resume_from_checkpoint=True)
-        logger.info(f"training_metrics: {train_metrics}")
-
-        logger.info("start evaluating performance")
-        eval_metrics = trainer.evaluate()
-        logger.info(f"evaluation metrics: {eval_metrics}")
-        trainer.save_model("/home/kewen_yang/Information_Extraction/RE_HuggingFace/model/checkpoint_2023_07_13_17_37.pt")
-
-        learning_curve = pd.DataFrame(trainer.state.log_history)
-        logger.info('\n\t' + learning_curve.to_string().replace('\n', '\n\t'))
+    learning_curve = pd.DataFrame(trainer.state.log_history)
+    logger.info('\n\t' + learning_curve.to_string().replace('\n', '\n\t'))
 
 
 elif task.name == "INFERENCE":
@@ -545,13 +531,13 @@ elif task.name == "INFERENCE":
         start = min(id)
         print(f"--------------New entity: at index {start}", current_entity)
 
-  # step 2: run LayoutLMv2ForRelationExtraction
+  # step 2: run LayoutLMForRelationExtraction
   entity_dict = {'start': [entity[0] for entity in entities],
           'end': [entity[1] for entity in entities],
           'label': [entity[3] for entity in entities]}
 
-  relation_extraction_model = LayoutLMv2ForRelationExtraction.from_pretrained("/home/kewen_yang/Information_Extraction/RE_HuggingFace/model/checkpoint_2023_07_11_15_49.pt/checkpoint-5000")
-  # relation_extraction_model = LayoutLMv2ForRelationExtraction.from_pretrained("nielsr/layoutxlm-finetuned-xfund-fr-re")
+  relation_extraction_model = LayoutLMForRelationExtraction.from_pretrained("/home/kewen_yang/Information_Extraction/RE_HuggingFace/model/checkpoint_2023_07_11_15_49.pt/checkpoint-5000")
+  # relation_extraction_model = LayoutLMForRelationExtraction.from_pretrained("nielsr/layoutxlm-finetuned-xfund-fr-re")
   relation_extraction_model.to(DEVICE)
 
   with torch.no_grad():
@@ -571,137 +557,145 @@ elif task.name == "INFERENCE":
 elif task.name == "XTRACT_INFER":
   """do inference by Xtract customized pipeline
   """
-  print("run inferencing ...")
-#   relation_extraction_model = LayoutLMForRelationExtraction.from_pretrained("/home/kewen_yang/Information_Extraction/RE_HuggingFace/model/checkpoint_2023_07_13_17_37.pt")
-  relation_extraction_model = LayoutLMv2ForRelationExtraction.from_pretrained("/home/kewen_yang/Information_Extraction/RE_HuggingFace/model/checkpoint_2023_07_12_14_54.pt")
+  print("initiating inferencing ...")
+  model_dir = "/home/kewen_yang/Information_Extraction/RE_HuggingFace/model/checkpoint_2023_08_01_15_26.pt"
+  relation_extraction_model = LayoutLMForRelationExtraction.from_pretrained(model_dir)
   relation_extraction_model.to(DEVICE)
-  tokenizer = LayoutLMTokenizer.from_pretrained("/home/kewen_yang/Information_Extraction/RE_HuggingFace/model/checkpoint_2023_07_12_14_54.pt")
+  tokenizer = LayoutLMTokenizer.from_pretrained(model_dir)
 
-  with open(ROOT / "dataset/test/AUTOVACSTORE-1-2-Bing-image_010.json", "rb") as f:
-    file = json.load(f)
+  for file_name in os.listdir("/home/kewen_yang/Information_Extraction/dataset/Xtract_json_Batch_3"):
 
-  entity_dict = file["entity_dict"]
-  entity_dict["label"] = [i for i in entity_dict["label"]]
-  inputs = file["input"]
+    # file_name = "10.json"
 
-  # # load image
-  test_image = Image.open(ROOT / 'dataset/test/AUTOVACSTORE-1-2-Bing-image_010.jpg')
-  # rescale image as RE model requires 224 x 224
-  test_image = test_image.resize((224, 224), resample=Image.Resampling.BILINEAR)
-  test_image = np.array(test_image)
-  # channel first
-  test_image = test_image.transpose(2, 0, 1)
-  # flip color channels from RGB to BGR (as Detectron2 requires this)
-  test_image = test_image[::-1, :, :]
+    with open(ROOT / "dataset/Xtract_json_Batch_3" / file_name, "rb") as f:
+        file = json.load(f)
 
-  inputs["image"] = [test_image]
-  print("----------------------------entities----------------------------------------")
-  print(f'questions: {[tokenizer.decode([i for i in inputs["input_ids"][0][s:e]]) for s, e, l in zip(entity_dict["start"], entity_dict["end"], entity_dict["label"]) if l == 1]}')
-  print(f'answers: {[tokenizer.decode([i for i in inputs["input_ids"][0][s:e]]) for s, e, l in zip(entity_dict["start"], entity_dict["end"], entity_dict["label"]) if l == 2]}')
-  print("----------------------------------------------------------------------------")
+    entity_dict = file["entity_dict"]
 
-  for k, v in inputs.items():
-    inputs[k] = torch.tensor(inputs[k])
+    # entity_dict = {k: v[8:10] for k, v in entity_dict.items()}
 
-  inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+    inputs = file["input"]
 
-  with torch.no_grad():
-    # inputs: {'input_ids', 'token_type_ids', 'attention_mask', 'bbox', 'image'}
-    outputs = relation_extraction_model(**inputs,
-                                        entities=[entity_dict],
-                                        relations=[{'start_index': [], 'end_index': [], 'head': [], 'tail': []}])
+    #   del inputs["image"]  # image is only applicable to v2 model now
 
-  res = defaultdict(list)
-  done = set()
-  for relation in outputs.pred_relations[0]:
-    head_start, head_end = relation['head']
-    tail_start, tail_end = relation['tail']
-    key_d = {}
-    key_d["id"] = relation["head_id"]
-    key_d["text"] = tokenizer.decode(inputs['input_ids'][0][head_start:head_end])
-    key_d["label"] = "question"
-    key_d["bbox"] = torch.cat((inputs['bbox'][0][head_start:head_end].min(0).values[:2], inputs['bbox'][0][head_start:head_end].max(0).values[2:]), 0).tolist()
-    key_d["linking"] = [[relation['head_id'], relation['tail_id']]]
-    res[relation["head_id"]].append(key_d)
-    done.add(key_d["id"])
-    print(f"Question: {key_d['text']}")
+    print("---------------------------------------------------------------------------------------------")
+    print("key-values before feeding to RE model:")
+    print(f'questions: {[tokenizer.decode([i for i in inputs["input_ids"][0][s:e]]) for s, e, l in zip(entity_dict["start"], entity_dict["end"], entity_dict["label"]) if l == 1]}')
+    print(f'answers: {[tokenizer.decode([i for i in inputs["input_ids"][0][s:e]]) for s, e, l in zip(entity_dict["start"], entity_dict["end"], entity_dict["label"]) if l == 2]}')
+    print("---------------------------------------------------------------------------------------------")
 
-    val_d = {}
-    val_d["id"] = relation["tail_id"]
-    val_d["text"] = tokenizer.decode(inputs['input_ids'][0][tail_start:tail_end])
-    val_d["label"] = "answer"
-    val_d["bbox"] = torch.cat((inputs['bbox'][0][tail_start:tail_end].min(0).values[:2], inputs['bbox'][0][tail_start:tail_end].max(0).values[2:]), 0).tolist()
-    val_d["linking"] = [[relation['head_id'], relation['tail_id']]]
-    res[relation["tail_id"]].append(val_d)
-    done.add(val_d["id"])
-    print(f"Answer:, {val_d['text']}")
-    print("----------")
+    for k, v in inputs.items():
+        inputs[k] = torch.tensor(inputs[k])
 
-  # remove duplicates
-  def remove_dup(lst):
-    if len(lst) == 1:
-      return lst[0]
+    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
 
-    out = lst.pop(0)
-    for e in lst:
-      out["linking"].append(copy.deepcopy(e["linking"][0]))
+    if len(entity_dict["label"]) == 0:
+        pred_rel = []
 
-    return out
+    else:
+        with torch.no_grad():
+            # inputs: {'input_ids', 'token_type_ids', 'attention_mask', 'bbox'}
+            outputs = relation_extraction_model(**inputs,
+                                                entities=[entity_dict],
+                                                relations=[{'start_index': [], 'end_index': [], 'head': [], 'tail': []}])
+        pred_rel = outputs.pred_relations[0]
 
-  def get_potential_que(avail_qns, ans, res):
-      if len(avail_qns) == 1:
-          return None
+    res = defaultdict(list)
+    print("---------------------------------------------------------------------------------------------")
+    print("key-value pairs by RE model:")
+    for relation in pred_rel:
+        head_start, head_end = relation['head']
+        tail_start, tail_end = relation['tail']
+        key_d = {}
+        key_d["id"] = relation["head_id"]
+        key_d["text"] = tokenizer.decode(inputs['input_ids'][0][head_start:head_end])
+        key_d["label"] = "question"
+        key_d["bbox"] = torch.cat((inputs['bbox'][0][head_start:head_end].min(0).values[:2], inputs['bbox'][0][head_start:head_end].max(0).values[2:]), 0).tolist()
+        key_d["linking"] = [[relation['head_id'], relation['tail_id']]]
+        key_d["row_idx"] = entity_dict["row_idx"][entity_dict["start"].index(head_start)]
+        res[relation["head_id"]].append(key_d)
+        print(f"Question: {key_d['text']}")
 
-      qns = [res[id] for id in avail_qns]
-      out = qns.pop(0)
-      dis = sqrt((ans["bbox"][0] - out["bbox"][2])**2 + (ans["bbox"][3] - out["bbox"][3])**2)
-      for q in qns:
-          if dis >= sqrt((ans["bbox"][0] - q["bbox"][2])**2 + (ans["bbox"][3] - q["bbox"][3])**2):
-              out = q
-              dis = sqrt((ans["bbox"][0] - q["bbox"][2])**2 + (ans["bbox"][3] - q["bbox"][3])**2)
+        val_d = {}
+        val_d["id"] = relation["tail_id"]
+        val_d["text"] = tokenizer.decode(inputs['input_ids'][0][tail_start:tail_end])
+        val_d["label"] = "answer"
+        val_d["bbox"] = torch.cat((inputs['bbox'][0][tail_start:tail_end].min(0).values[:2], inputs['bbox'][0][tail_start:tail_end].max(0).values[2:]), 0).tolist()
+        val_d["linking"] = [[relation['head_id'], relation['tail_id']]]
+        val_d["row_idx"] = entity_dict["row_idx"][entity_dict["start"].index(tail_start)]
+        res[relation["tail_id"]].append(val_d)
+        print(f"Answer:, {val_d['text']}")
+        print("-------------------------")
 
-      return out
+    # remove duplicates
+    def concat_links(lst):
+        """concantenate all the links for an entity
 
-  res = {k: remove_dup(v) for k, v in res.items()}
-  # remove links based on distance
-  for i in res.keys():
-      if res[i]['label'] == "question":
-          continue
+        Args:
+            lst: list of entities with same id, to be concatenated
 
-      avail_qs = [l[0] for l in res[i]["linking"]]
-      qns = get_potential_que(avail_qs, res[i], res)
-      if qns is not None:
-          res[i]["linking"] = [[int(qns["id"]), int(res[i]["id"])]]
-          res[qns["id"]]["linking"] = [[int(qns["id"]), int(res[i]["id"])]]
+        Returns:
+            Dict: entity
+        """
+        if len(lst) == 1:
+            return lst[0]
 
-  for i in res.keys():
-      if res[i]["label"] == "question" and len(res[i]["linking"]) > 1:
+        out = lst.pop(0)
+        for e in lst:
+            out["linking"].append(copy.deepcopy(e["linking"][0]))
 
-          drops = list()
-          for l in res[i]["linking"]:
-              if res[l[1]]["linking"][0][0] != i:
-                  drops.append(l)
+        return out
 
-          if drops:
-              for l in drops:
-                  res[i]["linking"].remove(l)
+    def choose_qentity(qns, ans):
+        if len(qns) == 1:
+            return None
 
-  res = list(res.values())
+        qns = sorted(qns, key=lambda q: (abs(q["row_idx"] - ans["row_idx"]), abs(ans["bbox"][0] - q["bbox"][2])))
 
-  keyvalue, unpaired = post_process_entities(res)
+        return qns[0]
 
-  out = {"keyvalue": keyvalue, "unpaired": unpaired}
+    res = {k: concat_links(v) for k, v in res.items()}
 
-  # print key value text
-  printable = {e["id"]: e for e in out["keyvalue"]}
-  print("Extracted Key-value pairs are:")
-  for e in printable.values():
-      if e["label"] == "question":
-          print(f'{e["text"]}:{printable[e["linking"]]["text"]}')
+    # remove redundant links based on distance
+    for i in res.keys():
+        if res[i]['label'] == "question":
+            continue
 
-  with open("/home/kewen_yang/Information_Extraction/dataset/RE_res/1.json", 'w') as f:
-      json.dump(out, f)
-  print()
+        all_qns = [res[l[0]] for l in res[i]["linking"]]
+        qns = choose_qentity(all_qns, res[i])
+        if qns is not None:
+            res[i]["linking"] = [[int(qns["id"]), int(res[i]["id"])]]
+            res[qns["id"]]["linking"] = [[int(qns["id"]), int(res[i]["id"])]]
+
+    for i in res.keys():
+        if res[i]["label"] == "question" and len(res[i]["linking"]) > 1:
+
+            drops = list()
+            for l in res[i]["linking"]:
+                if res[l[1]]["linking"][0][0] != i:
+                    drops.append(l)
+
+            if drops:
+                for l in drops:
+                    res[i]["linking"].remove(l)
+
+    res = list(res.values())
+
+    keyvalue, unpaired = post_process_entities(res)
+
+    out = {"keyvalue": keyvalue, "unpaired": unpaired}
+
+    # print key value text
+    printable = {e["id"]: e for e in out["keyvalue"]}
+    print("---------------------------------------------------------------------------------------------")
+    print("key-value pairs after post-processing:")
+    for e in printable.values():
+        if e["label"] == "question":
+            print(f'{e["text"]}:{printable[e["linking"]]["text"]}')
+
+    with open(ROOT / "dataset/RE_pred_Batch_3" / file_name, 'w') as f:
+        json.dump(out, f, indent=2)
+    print("---------------------------------------------------------------------------------------------")
 
 ################################################ Appendix ################################################
 """

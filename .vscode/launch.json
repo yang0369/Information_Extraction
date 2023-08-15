@@ -14,10 +14,22 @@
             "justMyCode": false,
         },
         {
-            "name": "Python: run RE_HuggingFace",
+            "name": "Python: run layoutlmv2_re",
             "type": "python",
             "request": "launch",
-            "program": "${workspaceFolder}/RE_HuggingFace/main.py",
+            "program": "${workspaceFolder}/RE_HuggingFace/layoutlmv2_re.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                // "CUDA_LAUNCH_BLOCKING": "1",
+                "PYTHONPATH": "${workspaceFolder}" // set multiple paths to sys.path, windows by semicolon while linux by colon
+            }
+        },
+        {
+            "name": "Python: run layoutlm_re",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/RE_HuggingFace/layoutlm_re.py",
             "console": "integratedTerminal",
             "justMyCode": true,
             "env": {
